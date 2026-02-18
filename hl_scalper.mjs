@@ -23,7 +23,8 @@ const MAX_POSITION_PCT = 0.30;
 const MAX_POSITIONS = 2;
 const STOP_LOSS_PCT = 0.015;
 const TAKE_PROFIT_PCT = 0.025;
-const MIN_CONFIDENCE = 0.50;
+const MIN_CONFIDENCE = 0.65;       // raised — don't trade weak signals
+const TAKER_FEE_PCT = 0.00035;     // 0.035% per side
 const COOLDOWN_MS = 300000;
 
 const DRY_RUN = !process.argv.includes('--live');
@@ -273,16 +274,20 @@ async function checkExits(coin, currentPrice) {
   const exitSide = pos.side === 'buy' ? 'sell' : 'buy';
 
   if (pnlPct <= -STOP_LOSS_PCT) {
-    log(`STOP LOSS ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}%`, 'EXIT');
-    const pnlUsd = pos.size * currentPrice * pnlPct * LEVERAGE;
+    const exitNotional = pos.size * currentPrice;
+    const exitFee = exitNotional * TAKER_FEE_PCT;
+    const pnlUsd = pos.size * currentPrice * pnlPct * LEVERAGE - exitFee;
+    log(`STOP LOSS ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}% ($${pnlUsd.toFixed(2)} incl fees)`, 'EXIT');
     await placeOrder(exitSide, pos.size, coin, true);
     totalPnl += pnlUsd;
     tradeCount++;
     delete positions[coin];
     cooldowns[coin] = Date.now() + COOLDOWN_MS;
   } else if (pnlPct >= TAKE_PROFIT_PCT) {
-    log(`TAKE PROFIT ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}%`, 'EXIT');
-    const pnlUsd = pos.size * currentPrice * pnlPct * LEVERAGE;
+    const exitNotional = pos.size * currentPrice;
+    const exitFee = exitNotional * TAKER_FEE_PCT;
+    const pnlUsd = pos.size * currentPrice * pnlPct * LEVERAGE - exitFee;
+    log(`TAKE PROFIT ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}% ($${pnlUsd.toFixed(2)} incl fees)`, 'EXIT');
     await placeOrder(exitSide, pos.size, coin, true);
     totalPnl += pnlUsd;
     tradeCount++;
@@ -370,9 +375,12 @@ async function run() {
         const fillPrice = await placeOrder(sig.direction, size, coin);
         if (fillPrice) {
           const entry = typeof fillPrice === 'number' ? fillPrice : sig.price;
+          const notional = size * entry;
+          const entryFee = notional * TAKER_FEE_PCT;
+          totalPnl -= entryFee;  // deduct entry fee immediately
           positions[coin] = { side: sig.direction, entry, size, time: Date.now(), confidence: sig.confidence };
           activeCount++;
-          log(`OPENED ${sig.direction.toUpperCase()} ${size} ${coin} @ $${entry.toFixed(2)} ($${(size * entry).toFixed(2)} notional, ${LEVERAGE}x)`, 'TRADE');
+          log(`OPENED ${sig.direction.toUpperCase()} ${size} ${coin} @ $${entry.toFixed(2)} ($${notional.toFixed(2)} notional, ${LEVERAGE}x) fee=$${entryFee.toFixed(4)}`, 'TRADE');
         }
       }
 
