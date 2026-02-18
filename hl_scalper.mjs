@@ -24,7 +24,8 @@ const MAX_POSITIONS = 2;
 const STOP_LOSS_PCT = 0.015;
 const TAKE_PROFIT_PCT = 0.025;
 const MIN_CONFIDENCE = 0.65;       // raised — don't trade weak signals
-const TAKER_FEE_PCT = 0.00035;     // 0.035% per side
+const TAKER_FEE_PCT = 0.00045;     // 0.045% taker per side
+const MAKER_FEE_PCT = 0.00015;     // 0.015% maker per side
 const COOLDOWN_MS = 300000;
 
 const DRY_RUN = !process.argv.includes('--live');
@@ -115,31 +116,48 @@ async function getMids() {
   return result;
 }
 
-async function placeOrder(side, size, coin, reduceOnly = false) {
+/**
+ * Place order. mode='market' = IOC taker, mode='limit' = GTC maker (rests on book).
+ * For entries we use limit (cheaper). For exits we use market (guaranteed).
+ */
+async function placeOrder(side, size, coin, reduceOnly = false, mode = 'market') {
   if (DRY_RUN) {
-    log(`[DRY RUN] Would ${side} ${size} ${coin}`, 'TRADE');
+    log(`[DRY RUN] Would ${side} ${size} ${coin} (${mode})`, 'TRADE');
     return true;
   }
   try {
     const isBuy = side === 'buy';
     const mids = await sdk.info.getAllMids();
     const price = parseFloat(mids[COIN_PERP[coin]]);
-    // 3% slippage for guaranteed market fills
-    const slipPx = toSigFigs(isBuy ? price * 1.03 : price * 0.97);
+
+    let limitPx, orderType;
+    if (mode === 'limit') {
+      // Post-only limit: place AT current mid price to sit on book as maker
+      // Slightly favorable to ensure it rests (buy just below mid, sell just above)
+      limitPx = toSigFigs(isBuy ? price * 0.9999 : price * 1.0001);
+      orderType = { limit: { tif: 'Alo' } }; // Add Liquidity Only (maker only)
+    } else {
+      // Market: IOC with 3% slippage
+      limitPx = toSigFigs(isBuy ? price * 1.03 : price * 0.97);
+      orderType = { limit: { tif: 'Ioc' } };
+    }
 
     const result = await sdk.exchange.placeOrder({
       coin: COIN_PERP[coin],
       is_buy: isBuy,
       sz: size,
-      limit_px: slipPx,
-      order_type: { limit: { tif: 'Ioc' } },
+      limit_px: limitPx,
+      order_type: orderType,
       reduce_only: reduceOnly,
     });
 
     const status = result?.response?.data?.statuses?.[0];
     if (status?.filled) {
-      log(`Filled ${side} ${size} ${coin} @ $${status.filled.avgPx}`, 'TRADE');
+      log(`Filled ${side} ${size} ${coin} @ $${status.filled.avgPx} (${mode})`, 'TRADE');
       return parseFloat(status.filled.avgPx);
+    } else if (status?.resting) {
+      log(`Resting ${side} ${size} ${coin} @ $${limitPx} (maker limit, oid=${status.resting.oid})`, 'TRADE');
+      return { resting: true, oid: status.resting.oid, price: parseFloat(limitPx) };
     } else if (status?.error) {
       log(`Order error: ${status.error}`, 'WARN');
       return false;
@@ -273,12 +291,15 @@ async function checkExits(coin, currentPrice) {
 
   const exitSide = pos.side === 'buy' ? 'sell' : 'buy';
 
+  // Skip pending (unfilled limit) orders for exit checks
+  if (pos.pending) return;
+
   if (pnlPct <= -STOP_LOSS_PCT) {
     const exitNotional = pos.size * currentPrice;
-    const exitFee = exitNotional * TAKER_FEE_PCT;
+    const exitFee = exitNotional * TAKER_FEE_PCT;  // exits always taker
     const pnlUsd = pos.size * currentPrice * pnlPct * LEVERAGE - exitFee;
-    log(`STOP LOSS ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}% ($${pnlUsd.toFixed(2)} incl fees)`, 'EXIT');
-    await placeOrder(exitSide, pos.size, coin, true);
+    log(`STOP LOSS ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}% ($${pnlUsd.toFixed(2)} net)`, 'EXIT');
+    await placeOrder(exitSide, pos.size, coin, true, 'market');
     totalPnl += pnlUsd;
     tradeCount++;
     delete positions[coin];
@@ -287,8 +308,8 @@ async function checkExits(coin, currentPrice) {
     const exitNotional = pos.size * currentPrice;
     const exitFee = exitNotional * TAKER_FEE_PCT;
     const pnlUsd = pos.size * currentPrice * pnlPct * LEVERAGE - exitFee;
-    log(`TAKE PROFIT ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}% ($${pnlUsd.toFixed(2)} incl fees)`, 'EXIT');
-    await placeOrder(exitSide, pos.size, coin, true);
+    log(`TAKE PROFIT ${coin}: entry=$${pos.entry.toFixed(2)} exit=$${currentPrice.toFixed(2)} pnl=${(pnlPct * 100).toFixed(2)}% ($${pnlUsd.toFixed(2)} net)`, 'EXIT');
+    await placeOrder(exitSide, pos.size, coin, true, 'market');
     totalPnl += pnlUsd;
     tradeCount++;
     winCount++;
@@ -336,6 +357,31 @@ async function run() {
       cycle++;
       if (cycle % 10 === 1) balance = await getBalance();
 
+      // Check pending limit orders — did they fill?
+      for (const [coin, pos] of Object.entries(positions)) {
+        if (!pos.pending) continue;
+        try {
+          const resp = await fetch('https://api.hyperliquid.xyz/info', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'orderStatus', user: WALLET_ADDRESS, oid: pos.oid })
+          });
+          const data = await resp.json();
+          const status = data?.order?.status;
+          if (status === 'filled') {
+            pos.pending = false;
+            log(`Limit FILLED ${coin} oid=${pos.oid}`, 'TRADE');
+          } else if (Date.now() - pos.time > 60000) {
+            // Cancel after 60s if unfilled — market moved away
+            await sdk.exchange.cancelOrder({ coin: COIN_PERP[coin], o: pos.oid });
+            log(`Cancelled stale limit ${coin} oid=${pos.oid}`, 'WARN');
+            delete positions[coin];
+          }
+        } catch (e) {
+          log(`Order status check failed: ${e.message}`, 'WARN');
+        }
+      }
+
       const signals = {};
       const prices = await getMids();
 
@@ -372,13 +418,22 @@ async function run() {
         log(`SIGNAL ${coin}: ${sig.direction.toUpperCase()} conf=${(sig.confidence * 100).toFixed(0)}% ` +
             `mom=${(sig.momentum * 100).toFixed(3)}% rsi=${sig.rsi.toFixed(1)} vol_r=${sig.volRatio.toFixed(2)} ${conf}`, 'SIGNAL');
 
-        const fillPrice = await placeOrder(sig.direction, size, coin);
-        if (fillPrice) {
-          const entry = typeof fillPrice === 'number' ? fillPrice : sig.price;
+        // Use ALO (maker) limit for entries — 0.015% vs 0.045% taker
+        const fillResult = await placeOrder(sig.direction, size, coin, false, 'limit');
+        if (fillResult) {
+          let entry, entryFee;
+          if (typeof fillResult === 'object' && fillResult.resting) {
+            // Order is resting on book — track as pending
+            entry = fillResult.price;
+            entryFee = size * entry * MAKER_FEE_PCT;
+            positions[coin] = { side: sig.direction, entry, size, time: Date.now(), confidence: sig.confidence, oid: fillResult.oid, pending: true };
+          } else {
+            entry = typeof fillResult === 'number' ? fillResult : sig.price;
+            entryFee = size * entry * MAKER_FEE_PCT;
+            positions[coin] = { side: sig.direction, entry, size, time: Date.now(), confidence: sig.confidence };
+          }
           const notional = size * entry;
-          const entryFee = notional * TAKER_FEE_PCT;
-          totalPnl -= entryFee;  // deduct entry fee immediately
-          positions[coin] = { side: sig.direction, entry, size, time: Date.now(), confidence: sig.confidence };
+          totalPnl -= entryFee;
           activeCount++;
           log(`OPENED ${sig.direction.toUpperCase()} ${size} ${coin} @ $${entry.toFixed(2)} ($${notional.toFixed(2)} notional, ${LEVERAGE}x) fee=$${entryFee.toFixed(4)}`, 'TRADE');
         }
