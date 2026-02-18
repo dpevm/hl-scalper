@@ -123,7 +123,8 @@ async function placeOrder(side, size, coin, reduceOnly = false) {
     const isBuy = side === 'buy';
     const mids = await sdk.info.getAllMids();
     const price = parseFloat(mids[COIN_PERP[coin]]);
-    const slipPx = toSigFigs(isBuy ? price * 1.005 : price * 0.995);
+    // 3% slippage for guaranteed market fills
+    const slipPx = toSigFigs(isBuy ? price * 1.03 : price * 0.97);
 
     const result = await sdk.exchange.placeOrder({
       coin: COIN_PERP[coin],
