@@ -23,9 +23,11 @@ const MAX_POSITION_PCT = 0.30;
 const MAX_POSITIONS = 2;
 const STOP_LOSS_PCT = 0.015;
 const TAKE_PROFIT_PCT = 0.025;
-const MIN_CONFIDENCE = 0.65;       // raised — don't trade weak signals
+const MIN_CONFIDENCE = 0.75;       // only high-conviction trades
 const TAKER_FEE_PCT = 0.00045;     // 0.045% taker per side
 const MAKER_FEE_PCT = 0.00015;     // 0.015% maker per side
+const MAX_DAILY_LOSS = 1.50;       // circuit breaker: stop trading if down $1.50/day
+const BREAKEVEN_TIMEOUT_MS = 180000; // close at breakeven if no movement after 3 min
 const COOLDOWN_MS = 300000;
 
 const DRY_RUN = !process.argv.includes('--live');
@@ -294,6 +296,22 @@ async function checkExits(coin, currentPrice) {
   // Skip pending (unfilled limit) orders for exit checks
   if (pos.pending) return;
 
+  // Breakeven timeout: if position is flat after 3 min, close it to free capital
+  const age = Date.now() - pos.time;
+  if (age > BREAKEVEN_TIMEOUT_MS && Math.abs(pnlPct) < 0.003) {
+    const exitNotional = pos.size * currentPrice;
+    const exitFee = exitNotional * TAKER_FEE_PCT;
+    const pnlUsd = pos.size * currentPrice * pnlPct * LEVERAGE - exitFee;
+    log(`TIMEOUT ${coin}: flat after ${(age/1000).toFixed(0)}s, closing ($${pnlUsd.toFixed(3)} net)`, 'EXIT');
+    await placeOrder(exitSide, pos.size, coin, true, 'market');
+    totalPnl += pnlUsd;
+    tradeCount++;
+    if (pnlUsd > 0) winCount++;
+    delete positions[coin];
+    cooldowns[coin] = Date.now() + COOLDOWN_MS;
+    return;
+  }
+
   if (pnlPct <= -STOP_LOSS_PCT) {
     const exitNotional = pos.size * currentPrice;
     const exitFee = exitNotional * TAKER_FEE_PCT;  // exits always taker
@@ -357,6 +375,19 @@ async function run() {
       cycle++;
       if (cycle % 10 === 1) balance = await getBalance();
 
+      // Circuit breaker: stop if daily loss exceeds limit
+      if (totalPnl <= -MAX_DAILY_LOSS) {
+        log(`⛔ CIRCUIT BREAKER: Daily loss $${totalPnl.toFixed(2)} exceeds -$${MAX_DAILY_LOSS}. Shutting down.`, 'WARN');
+        // Close all positions
+        for (const [c, p] of Object.entries(positions)) {
+          if (p.pending) continue;
+          const es = p.side === 'buy' ? 'sell' : 'buy';
+          await placeOrder(es, p.size, c, true, 'market');
+          log(`Emergency closed ${c}`, 'EXIT');
+        }
+        break;
+      }
+
       // Check pending limit orders — did they fill?
       for (const [coin, pos] of Object.entries(positions)) {
         if (!pos.pending) continue;
@@ -410,6 +441,7 @@ async function run() {
         if (positions[coin]) continue;
         if (cooldowns[coin] && Date.now() < cooldowns[coin]) continue;
         if (sig.confidence < MIN_CONFIDENCE) continue;
+        if (!sig.confirmed) continue;  // REQUIRE cross-coin confirmation
 
         const size = computeSize(coin, sig.price, balance);
         if (size <= 0) continue;
